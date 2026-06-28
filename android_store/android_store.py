@@ -122,6 +122,20 @@ class FDroidInterface(ServiceInterface):
         # Wait for the task to complete and return its result
         return await future
 
+    async def _enqueue_and_forget(self, task_func):
+        """Queue a task without waiting; outcome communicated via signals."""
+        future = asyncio.Future()
+        await self._task_queue.put((task_func, future))
+        self._reset_idle_timer()
+        future.add_done_callback(self._handle_forgotten_future)
+
+    def _handle_forgotten_future(self, future):
+        if not future.cancelled():
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Background task error: {e}")
+
     async def process_repo_file(self, config_file, repo_dir):
         """
         Process a single repository configuration file by iterating through its mirrors sequentially.
@@ -210,20 +224,28 @@ class FDroidInterface(ServiceInterface):
 
     @method()
     async def Install(self, package_id: 's') -> 'b':
+        if not package_id:
+            return False
+
+        self.InstallStatus(package_id, "queued")
+
         async def _install_task():
             logger.info(f"Installing package {package_id}")
 
             if not await ping_session_manager():
-                return False
+                self.InstallFailed(package_id, "Andromeda session not running")
+                return
 
             if not await self.ensure_populated():
-                return False
+                self.InstallFailed(package_id, "Failed to populate package database")
+                return
 
             try:
                 package_info = await get_package_by_id(self.db, package_id, msgspec.json.decode)
                 if not package_info:
                     logger.error(f"Package {package_id} not found")
-                    return False
+                    self.InstallFailed(package_id, f"Package {package_id} not found")
+                    return
 
                 os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
                 await self.ensure_session()
@@ -236,7 +258,8 @@ class FDroidInterface(ServiceInterface):
                 )
 
                 if not result:
-                    return False
+                    self.InstallFailed(package_id, "Download failed")
+                    return
 
                 logger.info(f"APK downloaded to: {filepath}")
                 self.InstallStatus(package_id, "installing")
@@ -246,13 +269,15 @@ class FDroidInterface(ServiceInterface):
                 if success:
                     self.AppInstalled(package_id)
                     logger.success(f"Successfully installed {package_id}")
-                    return True
-                logger.error(f"Failed to install {package_id}")
-                return False
+                else:
+                    logger.error(f"Failed to install {package_id}")
+                    self.InstallFailed(package_id, "Installation failed")
             except Exception as e:
                 logger.error(f"Installation failed: {e}")
-                return False
-        return await self._queue_task(_install_task)
+                self.InstallFailed(package_id, str(e))
+
+        await self._enqueue_and_forget(_install_task)
+        return True
 
     @signal()
     def AppInstalled(self, package_id: 's') -> 's':
@@ -265,6 +290,14 @@ class FDroidInterface(ServiceInterface):
     @signal()
     def InstallStatus(self, package_id: 's', status: 's') -> 'ss':
         return package_id, status
+
+    @signal()
+    def InstallFailed(self, package_id: 's', error: 's') -> 'ss':
+        return package_id, error
+
+    @signal()
+    def UpgradeComplete(self, success: 'b') -> 'b':
+        return success
 
     @method()
     async def GetRepositories(self) -> 'a(ss)':
@@ -335,10 +368,11 @@ class FDroidInterface(ServiceInterface):
             logger.info(f"Upgrading packages {packages}")
 
             if not await ping_session_manager():
-                return False
+                self.UpgradeComplete(False)
+                return
 
             upgradables = await self.get_upgradable_packages()
-            upgrade_list = packages
+            upgrade_list = list(packages)
 
             if not upgrade_list:
                 upgrade_list = [pkg['id'] for pkg in upgradables]
@@ -346,46 +380,57 @@ class FDroidInterface(ServiceInterface):
 
             if not upgrade_list:
                 logger.info("No packages to upgrade")
-                return True
+                self.UpgradeComplete(True)
+                return
 
             os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
             await self.ensure_session()
+            overall_success = True
 
             for package_id in upgrade_list:
-                for pkg in upgradables:
-                    if pkg['id'] == package_id:
-                        logger.info(f"Installing upgrade for {package_id}")
-                        try:
-                            package_info = pkg['packageInfo']
-                            download_url = package_info['download_url']
-                            apk_name = package_info['apk_name']
-                            filepath = os.path.join(DOWNLOAD_CACHE_DIR, apk_name)
+                pkg_info = next((pkg for pkg in upgradables if pkg['id'] == package_id), None)
+                if pkg_info is None:
+                    continue
 
-                            self.InstallStatus(package_id, "downloading")
-                            result = await download_file(
-                                self.session, download_url, filepath,
-                                progress_callback=lambda p: self.DownloadProgress(package_id, p)
-                            )
-                            if not result:
-                                logger.error(f"Failed to download {package_id}")
-                                continue
+                logger.info(f"Installing upgrade for {package_id}")
+                try:
+                    package_info = pkg_info['packageInfo']
+                    filepath = os.path.join(DOWNLOAD_CACHE_DIR, package_info['apk_name'])
 
-                            logger.info(f"APK downloaded to: {filepath}")
-                            self.InstallStatus(package_id, "installing")
-                            success = await install_app(filepath)
-                            os.remove(filepath)
+                    self.InstallStatus(package_id, "downloading")
+                    result = await download_file(
+                        self.session, package_info['download_url'], filepath,
+                        progress_callback=lambda p: self.DownloadProgress(package_id, p)
+                    )
+                    if not result:
+                        logger.error(f"Failed to download {package_id}")
+                        self.InstallFailed(package_id, "Download failed")
+                        overall_success = False
+                        break
 
-                            if not success:
-                                logger.error(f"Failed to upgrade {package_id}")
-                                return False
+                    logger.info(f"APK downloaded to: {filepath}")
+                    self.InstallStatus(package_id, "installing")
+                    success = await install_app(filepath)
+                    os.remove(filepath)
 
-                            break
-                        except Exception as e:
-                            logger.error(f"Error upgrading {package_id}: {e}")
-                            return False
+                    if success:
+                        self.AppInstalled(package_id)
+                    else:
+                        logger.error(f"Failed to upgrade {package_id}")
+                        self.InstallFailed(package_id, "Installation failed")
+                        overall_success = False
+                        break
+                except Exception as e:
+                    logger.error(f"Error upgrading {package_id}: {e}")
+                    self.InstallFailed(package_id, str(e))
+                    overall_success = False
+                    break
+
             await self.cleanup_session()
-            return True
-        return await self._queue_task(_upgrade_packages_task)
+            self.UpgradeComplete(overall_success)
+
+        await self._enqueue_and_forget(_upgrade_packages_task)
+        return True
 
     @method()
     async def RemoveRepository(self, repo_id: 's') -> 'b':

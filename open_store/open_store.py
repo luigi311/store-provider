@@ -148,6 +148,20 @@ class OpenStoreInterface(ServiceInterface):
         # Wait for the task to complete and return its result
         return await future
 
+    async def _enqueue_and_forget(self, task_func):
+        """Queue a task without waiting; outcome communicated via signals."""
+        future = asyncio.Future()
+        await self._task_queue.put((task_func, future))
+        self._reset_idle_timer()
+        future.add_done_callback(self._handle_forgotten_future)
+
+    def _handle_forgotten_future(self, future):
+        if not future.cancelled():
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Background task error: {e}")
+
     async def fetch_all_apps(self):
         """Fetch all apps from the OpenStore API"""
         await self.ensure_session()
@@ -224,10 +238,16 @@ class OpenStoreInterface(ServiceInterface):
 
     @method()
     async def Install(self, package_id: "s") -> "b":
-        async def _install_task():
-            return await self.install_package(package_id)
+        if not package_id:
+            return False
 
-        return await self._queue_task(_install_task)
+        self.InstallStatus(package_id, "queued")
+
+        async def _install_task():
+            await self.install_package(package_id)
+
+        await self._enqueue_and_forget(_install_task)
+        return True
 
     async def install_package(self, package_id):
         logger.info(f"Installing package {package_id}")
@@ -240,11 +260,13 @@ class OpenStoreInterface(ServiceInterface):
         app_details = await get_app_details(self.session, package_id)
         if not app_details:
             logger.error(f"Could not get app details for {package_id}")
+            self.InstallFailed(package_id, "Could not fetch app metadata")
             return False
 
         downloads = app_details.get("downloads", [])
         if not downloads:
             logger.error(f"No downloads available for {package_id}")
+            self.InstallFailed(package_id, "No downloads available")
             return False
 
         compatible_download = find_compatible_download(downloads, self.system_arch)
@@ -252,6 +274,7 @@ class OpenStoreInterface(ServiceInterface):
             logger.error(
                 f"No compatible download found for {package_id} on {self.system_arch}"
             )
+            self.InstallFailed(package_id, f"No compatible download for {self.system_arch}")
             return False
 
         download_url = compatible_download.get("download_url")
@@ -261,6 +284,7 @@ class OpenStoreInterface(ServiceInterface):
 
         if not download_url:
             logger.error(f"No download URL for {package_id}")
+            self.InstallFailed(package_id, "No download URL")
             return False
 
         # Ensure Lomiri support is present
@@ -284,6 +308,7 @@ class OpenStoreInterface(ServiceInterface):
             )
             if not click_path:
                 logger.error(f"Failed to download {package_id}")
+                self.InstallFailed(package_id, "Download failed")
                 return False
 
             # Remove any existing installation
@@ -307,6 +332,7 @@ class OpenStoreInterface(ServiceInterface):
             extracted_dir = extract_click_package(click_path, app_dir)
             if not extracted_dir:
                 logger.error(f"Failed to extract {package_id}")
+                self.InstallFailed(package_id, "Extraction failed")
                 return False
 
             # Process desktop files
@@ -335,6 +361,7 @@ class OpenStoreInterface(ServiceInterface):
                 )
                 return True
             logger.error("Error saving installation details")
+            self.InstallFailed(package_id, "Failed to save installation details")
             return False
 
     @signal()
@@ -348,6 +375,14 @@ class OpenStoreInterface(ServiceInterface):
     @signal()
     def InstallStatus(self, package_id: "s", status: "s") -> "ss":
         return package_id, status
+
+    @signal()
+    def InstallFailed(self, package_id: "s", error: "s") -> "ss":
+        return package_id, error
+
+    @signal()
+    def UpgradeComplete(self, success: "b") -> "b":
+        return success
 
     async def get_upgradable_apps(self, installed_apps):
         logger.info("Checking for upgradable apps")
@@ -450,7 +485,7 @@ class OpenStoreInterface(ServiceInterface):
         async def _upgrade_packages_task():
             logger.info(f"Upgrading packages {packages}")
 
-            upgrade_list = packages
+            upgrade_list = list(packages)
             if not upgrade_list:
                 try:
                     installed_apps = await get_installed_apps(self.installed_db)
@@ -458,22 +493,26 @@ class OpenStoreInterface(ServiceInterface):
                     upgrade_list = [app["id"].value for app in upgradable_apps]
                 except Exception as e:
                     logger.error(f"Error getting upgradable apps: {e}")
-                    return False
+                    self.UpgradeComplete(False)
+                    return
 
             if not upgrade_list:
                 logger.info("No packages to upgrade")
-                return True
+                self.UpgradeComplete(True)
+                return
 
             logger.info(f"Upgrading packages: {', '.join(upgrade_list)}")
-            success = True
+            overall_success = True
 
             for package_id in upgrade_list:
                 if not await self.install_package(package_id):
                     logger.error(f"Failed to upgrade {package_id}")
-                    success = False
-            return success
+                    overall_success = False
 
-        return await self._queue_task(_upgrade_packages_task)
+            self.UpgradeComplete(overall_success)
+
+        await self._enqueue_and_forget(_upgrade_packages_task)
+        return True
 
     @method()
     async def GetInstalledApps(self) -> "aa{sv}":
