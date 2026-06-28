@@ -3,9 +3,13 @@
 # Copyright (C) 2025 Luis Garcia <git@luigi311.com>
 
 import os
+
 from loguru import logger
 
-async def download_file(session, url, output_path, headers=None):
+
+async def download_file(
+    session, url, output_path, headers=None, progress_callback=None
+):
     """
     Download a file from a URL to the specified path.
 
@@ -31,10 +35,11 @@ async def download_file(session, url, output_path, headers=None):
                 return False
 
             # Download the file in chunks
-            with open(output_path, 'wb') as f:
-                total = int(response.headers.get('content-length', 0))
+            with open(output_path, "wb") as f:
+                total = int(response.headers.get("content-length", 0))
                 downloaded = 0
                 chunk_size = 65536
+                last_progress = -1
 
                 async for chunk in response.content.iter_chunked(chunk_size):
                     f.write(chunk)
@@ -42,6 +47,9 @@ async def download_file(session, url, output_path, headers=None):
                     if total > 0:
                         progress = int(downloaded * 100 / total)
                         logger.trace(f"Download progress: {progress}%")
+                        if progress_callback and progress != last_progress:
+                            progress_callback(progress)
+                            last_progress = progress
             return True
     except Exception as e:
         logger.error(f"Error downloading file: {e}")

@@ -228,13 +228,18 @@ class FDroidInterface(ServiceInterface):
                 os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
                 await self.ensure_session()
 
+                self.InstallStatus(package_id, "downloading")
                 filepath = os.path.join(DOWNLOAD_CACHE_DIR, package_info['apk_name'])
-                result = await download_file(self.session, package_info['download_url'], filepath)
+                result = await download_file(
+                    self.session, package_info['download_url'], filepath,
+                    progress_callback=lambda p: self.DownloadProgress(package_id, p)
+                )
 
                 if not result:
                     return False
 
                 logger.info(f"APK downloaded to: {filepath}")
+                self.InstallStatus(package_id, "installing")
                 success = await install_app(filepath)
                 os.remove(filepath)
 
@@ -252,6 +257,14 @@ class FDroidInterface(ServiceInterface):
     @signal()
     def AppInstalled(self, package_id: 's') -> 's':
         return package_id
+
+    @signal()
+    def DownloadProgress(self, package_id: 's', progress: 'i') -> 'si':
+        return package_id, progress
+
+    @signal()
+    def InstallStatus(self, package_id: 's', status: 's') -> 'ss':
+        return package_id, status
 
     @method()
     async def GetRepositories(self) -> 'a(ss)':
@@ -348,12 +361,17 @@ class FDroidInterface(ServiceInterface):
                             apk_name = package_info['apk_name']
                             filepath = os.path.join(DOWNLOAD_CACHE_DIR, apk_name)
 
-                            result = await download_file(self.session, download_url, filepath)
+                            self.InstallStatus(package_id, "downloading")
+                            result = await download_file(
+                                self.session, download_url, filepath,
+                                progress_callback=lambda p: self.DownloadProgress(package_id, p)
+                            )
                             if not result:
                                 logger.error(f"Failed to download {package_id}")
                                 continue
 
                             logger.info(f"APK downloaded to: {filepath}")
+                            self.InstallStatus(package_id, "installing")
                             success = await install_app(filepath)
                             os.remove(filepath)
 

@@ -1,34 +1,42 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2025 Bardia Moshiri <bardia@furilabs.com>
 
-from time import time
-import tempfile
 import asyncio
-import aiohttp
-import shutil
 import json
 import os
+import shutil
+import tempfile
+from time import time
 
+import aiohttp
+from dbus_fast import BusType, Variant
 from dbus_fast.aio import MessageBus
 from dbus_fast.service import ServiceInterface, method, signal
-from dbus_fast import BusType, Variant
-
 from loguru import logger
 
 from common.utils import download_file
-from open_store.database import (
-    init_app_database, init_installed_database, save_app_list,
-    search_apps, save_installed_app, remove_installed_app,
-    get_installed_apps, get_installed_app
-)
 from open_store.api import fetch_app_list, get_app_details
 from open_store.apt import (
-    is_debian_package_installed, install_debian_package, update_debian_cache
+    install_debian_package,
+    is_debian_package_installed,
+    update_debian_cache,
 )
 from open_store.click import (
-    extract_click_package, get_system_architecture,
+    cleanup_desktop_files,
+    extract_click_package,
     find_compatible_download,
-    process_desktop_files, cleanup_desktop_files
+    get_system_architecture,
+    process_desktop_files,
+)
+from open_store.database import (
+    get_installed_app,
+    get_installed_apps,
+    init_app_database,
+    init_installed_database,
+    remove_installed_app,
+    save_app_list,
+    save_installed_app,
+    search_apps,
 )
 
 DATABASE = os.path.expanduser("~/.cache/store-provider/open-store/open-store.db")
@@ -38,10 +46,11 @@ INSTALLED_DB = os.path.expanduser("~/.local/store-provider/open-store/apps.db")
 APPS_DIR = os.path.expanduser("~/.local/store-provider/open-store")
 OPENSTORE_API_URL = "https://open-store.io/api/v4/apps"
 
+
 class OpenStoreInterface(ServiceInterface):
     def __init__(self, idle_callback=None):
         logger.info("Initializing OpenStore service")
-        super().__init__('io.FuriOS.OpenStore')
+        super().__init__("io.FuriOS.OpenStore")
         self.session = None
         self.db = None
         self.installed_db = None
@@ -150,7 +159,9 @@ class OpenStoreInterface(ServiceInterface):
 
         return False
 
-    async def download_app(self, download_url, app_id, version, output_dir):
+    async def download_app(
+        self, download_url, app_id, version, output_dir, progress_callback=None
+    ):
         await self.ensure_session()
 
         try:
@@ -162,7 +173,8 @@ class OpenStoreInterface(ServiceInterface):
                 self.session,
                 download_url,
                 output_path,
-                headers=headers
+                headers=headers,
+                progress_callback=progress_callback,
             )
 
             if success:
@@ -172,7 +184,7 @@ class OpenStoreInterface(ServiceInterface):
         return None
 
     @method()
-    async def Search(self, query: 's') -> 's':
+    async def Search(self, query: "s") -> "s":
         async def _search_task():
             logger.info(f"Searching for {query}")
 
@@ -189,7 +201,7 @@ class OpenStoreInterface(ServiceInterface):
         return await _search_task()
 
     @method()
-    async def GetRepositories(self) -> 'a(ss)':
+    async def GetRepositories(self) -> "a(ss)":
         async def _get_repositories_task():
             logger.info("Getting repositories")
             # For now, just return OpenStore as the only repository
@@ -198,7 +210,7 @@ class OpenStoreInterface(ServiceInterface):
         return await _get_repositories_task()
 
     @method()
-    async def UpdateCache(self) -> 'b':
+    async def UpdateCache(self) -> "b":
         async def _update_cache_task():
             logger.info("Updating cache")
             try:
@@ -211,7 +223,7 @@ class OpenStoreInterface(ServiceInterface):
         return await self._queue_task(_update_cache_task)
 
     @method()
-    async def Install(self, package_id: 's') -> 'b':
+    async def Install(self, package_id: "s") -> "b":
         async def _install_task():
             return await self.install_package(package_id)
 
@@ -224,25 +236,28 @@ class OpenStoreInterface(ServiceInterface):
         await self.ensure_session()
 
         # Fetch app metadata
+        self.InstallStatus(package_id, "fetching_metadata")
         app_details = await get_app_details(self.session, package_id)
         if not app_details:
             logger.error(f"Could not get app details for {package_id}")
             return False
 
-        downloads = app_details.get('downloads', [])
+        downloads = app_details.get("downloads", [])
         if not downloads:
             logger.error(f"No downloads available for {package_id}")
             return False
 
         compatible_download = find_compatible_download(downloads, self.system_arch)
         if not compatible_download:
-            logger.error(f"No compatible download found for {package_id} on {self.system_arch}")
+            logger.error(
+                f"No compatible download found for {package_id} on {self.system_arch}"
+            )
             return False
 
-        download_url = compatible_download.get('download_url')
-        version      = compatible_download.get('version', '0.0.0')
-        arch         = compatible_download.get('architecture')
-        channel      = compatible_download.get('channel')
+        download_url = compatible_download.get("download_url")
+        version = compatible_download.get("version", "0.0.0")
+        arch = compatible_download.get("architecture")
+        channel = compatible_download.get("channel")
 
         if not download_url:
             logger.error(f"No download URL for {package_id}")
@@ -250,6 +265,7 @@ class OpenStoreInterface(ServiceInterface):
 
         # Ensure Lomiri support is present
         if not is_debian_package_installed("furios-lomiri-app-support"):
+            self.InstallStatus(package_id, "installing_dependencies")
             await update_debian_cache()
             await install_debian_package("furios-lomiri-app-support")
         else:
@@ -258,8 +274,13 @@ class OpenStoreInterface(ServiceInterface):
         # Download and unpack the click package
         with tempfile.TemporaryDirectory() as temp_download_dir:
             logger.info(f"Downloading {package_id} ({version}) from {download_url}")
+            self.InstallStatus(package_id, "downloading")
             click_path = await self.download_app(
-                download_url, package_id, version, temp_download_dir
+                download_url,
+                package_id,
+                version,
+                temp_download_dir,
+                progress_callback=lambda p: self.DownloadProgress(package_id, p),
             )
             if not click_path:
                 logger.error(f"Failed to download {package_id}")
@@ -269,7 +290,7 @@ class OpenStoreInterface(ServiceInterface):
             try:
                 old_app = await get_installed_app(self.installed_db, package_id)
                 if old_app:
-                    old_app_dir = old_app['app_dir']
+                    old_app_dir = old_app["app_dir"]
                     cleanup_desktop_files(package_id)
                     if old_app_dir and os.path.exists(old_app_dir):
                         shutil.rmtree(old_app_dir)
@@ -282,38 +303,51 @@ class OpenStoreInterface(ServiceInterface):
             os.makedirs(app_dir, exist_ok=True)
 
             # Extract click package
+            self.InstallStatus(package_id, "extracting")
             extracted_dir = extract_click_package(click_path, app_dir)
             if not extracted_dir:
                 logger.error(f"Failed to extract {package_id}")
                 return False
 
             # Process desktop files
+            self.InstallStatus(package_id, "configuring")
             desktop_files = process_desktop_files(package_id, app_dir)
-            logger.info(f"Processed {len(desktop_files)} desktop files for {package_id}")
+            logger.info(
+                f"Processed {len(desktop_files)} desktop files for {package_id}"
+            )
 
-            # Record installation in database
             current_time = time()
             success = await save_installed_app(
                 self.installed_db,
                 package_id,
-                app_details.get('name', ''),
+                app_details.get("name", ""),
                 version,
                 channel,
                 arch,
                 current_time,
-                app_dir
+                app_dir,
             )
 
             if success:
                 self.AppInstalled(package_id)
-                logger.info(f"Successfully installed {package_id} v{version} for {arch}")
+                logger.info(
+                    f"Successfully installed {package_id} v{version} for {arch}"
+                )
                 return True
             logger.error("Error saving installation details")
             return False
 
     @signal()
-    def AppInstalled(self, package_id: 's') -> 's':
+    def AppInstalled(self, package_id: "s") -> "s":
         return package_id
+
+    @signal()
+    def DownloadProgress(self, package_id: "s", progress: "i") -> "si":
+        return package_id, progress
+
+    @signal()
+    def InstallStatus(self, package_id: "s", status: "s") -> "ss":
+        return package_id, status
 
     async def get_upgradable_apps(self, installed_apps):
         logger.info("Checking for upgradable apps")
@@ -323,20 +357,23 @@ class OpenStoreInterface(ServiceInterface):
             await self.ensure_session()
 
             for app in installed_apps:
-                app_id = app['id']
-                app_name = app['name']
-                current_version = app['version']
-                channel = app['channel']
-                architecture = app['architecture']
+                app_id = app["id"]
+                app_name = app["name"]
+                current_version = app["version"]
+                channel = app["channel"]
+                architecture = app["architecture"]
 
                 app_details = await get_app_details(self.session, app_id)
                 if not app_details:
                     continue
 
-                downloads = app_details.get('downloads', [])
-                compatible_downloads = [d for d in downloads if
-                                        d.get('architecture') == architecture or
-                                        d.get('architecture') == 'all']
+                downloads = app_details.get("downloads", [])
+                compatible_downloads = [
+                    d
+                    for d in downloads
+                    if d.get("architecture") == architecture
+                    or d.get("architecture") == "all"
+                ]
 
                 if not compatible_downloads:
                     continue
@@ -345,35 +382,50 @@ class OpenStoreInterface(ServiceInterface):
                 latest_download = None
 
                 # Try to find matching channel first
-                channel_downloads = [d for d in compatible_downloads if d.get('channel') == channel]
+                channel_downloads = [
+                    d for d in compatible_downloads if d.get("channel") == channel
+                ]
                 if channel_downloads:
-                    latest_download = max(channel_downloads, key=lambda x: int(x.get('revision', 0)))
-                    latest_version = latest_download.get('version', '0.0.0')
+                    latest_download = max(
+                        channel_downloads, key=lambda x: int(x.get("revision", 0))
+                    )
+                    latest_version = latest_download.get("version", "0.0.0")
                 else:
                     # If no match by channel, try focal
-                    focal_downloads = [d for d in compatible_downloads if d.get('channel') == 'focal']
+                    focal_downloads = [
+                        d for d in compatible_downloads if d.get("channel") == "focal"
+                    ]
                     if focal_downloads:
-                        latest_download = max(focal_downloads, key=lambda x: int(x.get('revision', 0)))
-                        latest_version = latest_download.get('version', '0.0.0')
+                        latest_download = max(
+                            focal_downloads, key=lambda x: int(x.get("revision", 0))
+                        )
+                        latest_version = latest_download.get("version", "0.0.0")
                     # If no focal either, just get the latest revision
                     else:
-                        latest_download = max(compatible_downloads, key=lambda x: int(x.get('revision', 0)))
-                        latest_version = latest_download.get('version', '0.0.0')
+                        latest_download = max(
+                            compatible_downloads,
+                            key=lambda x: int(x.get("revision", 0)),
+                        )
+                        latest_version = latest_download.get("version", "0.0.0")
 
                 if latest_version != current_version:
                     app_info = {
-                        'id': Variant('s', app_id),
-                        'name': Variant('s', app_name),
-                        'packageName': Variant('s', app_id),
-                        'currentVersion': Variant('s', current_version),
-                        'availableVersion': Variant('s', latest_version),
-                        'architecture': Variant('s', architecture),
-                        'repository': Variant('s', 'OpenStore'),
-                        'download_url': Variant('s', latest_download.get('download_url', '')),
-                        'channel': Variant('s', latest_download.get('channel', ''))
+                        "id": Variant("s", app_id),
+                        "name": Variant("s", app_name),
+                        "packageName": Variant("s", app_id),
+                        "currentVersion": Variant("s", current_version),
+                        "availableVersion": Variant("s", latest_version),
+                        "architecture": Variant("s", architecture),
+                        "repository": Variant("s", "OpenStore"),
+                        "download_url": Variant(
+                            "s", latest_download.get("download_url", "")
+                        ),
+                        "channel": Variant("s", latest_download.get("channel", "")),
                     }
                     upgradable.append(app_info)
-                    logger.info(f"Upgradable: {app_id} from {current_version} to {latest_version}")
+                    logger.info(
+                        f"Upgradable: {app_id} from {current_version} to {latest_version}"
+                    )
 
             return upgradable
         except Exception as e:
@@ -381,7 +433,7 @@ class OpenStoreInterface(ServiceInterface):
             return []
 
     @method()
-    async def GetUpgradable(self) -> 'aa{sv}':
+    async def GetUpgradable(self) -> "aa{sv}":
         async def _get_upgradable_task():
             logger.info("Getting upgradable apps")
             try:
@@ -394,7 +446,7 @@ class OpenStoreInterface(ServiceInterface):
         return await _get_upgradable_task()
 
     @method()
-    async def UpgradePackages(self, packages: 'as') -> 'b':
+    async def UpgradePackages(self, packages: "as") -> "b":
         async def _upgrade_packages_task():
             logger.info(f"Upgrading packages {packages}")
 
@@ -403,7 +455,7 @@ class OpenStoreInterface(ServiceInterface):
                 try:
                     installed_apps = await get_installed_apps(self.installed_db)
                     upgradable_apps = await self.get_upgradable_apps(installed_apps)
-                    upgrade_list = [app['id'].value for app in upgradable_apps]
+                    upgrade_list = [app["id"].value for app in upgradable_apps]
                 except Exception as e:
                     logger.error(f"Error getting upgradable apps: {e}")
                     return False
@@ -420,10 +472,11 @@ class OpenStoreInterface(ServiceInterface):
                     logger.error(f"Failed to upgrade {package_id}")
                     success = False
             return success
+
         return await self._queue_task(_upgrade_packages_task)
 
     @method()
-    async def GetInstalledApps(self) -> 'aa{sv}':
+    async def GetInstalledApps(self) -> "aa{sv}":
         async def _get_installed_apps_task():
             logger.info("Getting installed apps")
             result = []
@@ -432,14 +485,14 @@ class OpenStoreInterface(ServiceInterface):
                 installed_apps = await get_installed_apps(self.installed_db)
                 for app in installed_apps:
                     app_info = {
-                        'id': Variant('s', app['id']),
-                        'packageName': Variant('s', app['id']),
-                        'name': Variant('s', app['name']),
-                        'versionName': Variant('s', app['version']),
-                        'channel': Variant('s', app['channel']),
-                        'architecture': Variant('s', app['architecture']),
-                        'installDate': Variant('d', float(app['install_date'])),
-                        'state': Variant('s', 'installed')
+                        "id": Variant("s", app["id"]),
+                        "packageName": Variant("s", app["id"]),
+                        "name": Variant("s", app["name"]),
+                        "versionName": Variant("s", app["version"]),
+                        "channel": Variant("s", app["channel"]),
+                        "architecture": Variant("s", app["architecture"]),
+                        "installDate": Variant("d", float(app["install_date"])),
+                        "state": Variant("s", "installed"),
                     }
                     result.append(app_info)
 
@@ -451,7 +504,7 @@ class OpenStoreInterface(ServiceInterface):
         return await _get_installed_apps_task()
 
     @method()
-    async def UninstallApp(self, package_name: 's') -> 'b':
+    async def UninstallApp(self, package_name: "s") -> "b":
         async def _uninstall_app_task():
             logger.info(f"Uninstalling app {package_name}")
 
@@ -461,7 +514,7 @@ class OpenStoreInterface(ServiceInterface):
                     logger.error(f"App {package_name} not found in installed apps")
                     return False
 
-                app_dir = app['app_dir']
+                app_dir = app["app_dir"]
                 cleanup_desktop_files(package_name)
                 await remove_installed_app(self.installed_db, package_name)
 
@@ -494,8 +547,9 @@ class OpenStoreInterface(ServiceInterface):
         await self.cleanup_session()
         if self.db:
             await self.db.close()
-        if hasattr(self, 'installed_db') and self.installed_db:
+        if hasattr(self, "installed_db") and self.installed_db:
             await self.installed_db.close()
+
 
 class OpenStoreService:
     def __init__(self, idle_callback=None):
@@ -506,13 +560,11 @@ class OpenStoreService:
 
     async def setup(self):
         self.bus = await MessageBus(bus_type=BusType.SESSION).connect()
-        self.openstore_interface = OpenStoreInterface(
-            idle_callback=self.idle_callback
-        )
+        self.openstore_interface = OpenStoreInterface(idle_callback=self.idle_callback)
 
         await self.openstore_interface.init_db()
-        self.bus.export('/', self.openstore_interface)
-        await self.bus.request_name('io.FuriOS.OpenStore')
+        self.bus.export("/", self.openstore_interface)
+        await self.bus.request_name("io.FuriOS.OpenStore")
 
         return self.bus
 
